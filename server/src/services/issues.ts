@@ -6292,6 +6292,22 @@ export function issueService(db: Db) {
           const workspace = await assertValidExecutionWorkspace(companyId, null, executionWorkspaceId, tx);
           issueData.projectId = workspace.projectId;
         }
+        // Gate B (INT-465): a closed project (paused_at/archived_at) never
+        // accepts new cards — including children inheriting the parent's
+        // project. Covers routes and internal/agent creation paths.
+        if (issueData.projectId) {
+          const projectGate = await tx
+            .select({ pausedAt: projects.pausedAt, archivedAt: projects.archivedAt })
+            .from(projects)
+            .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
+            .then((rows) => rows[0] ?? null);
+          if (projectGate && (projectGate.pausedAt !== null || projectGate.archivedAt !== null)) {
+            throw unprocessable("projeto encerrado: não criar card (paused_at/archived_at)", {
+              code: "project_closed",
+              projectId: issueData.projectId,
+            });
+          }
+        }
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         // Cache the project policy lookup for this insert so the default
         // workspace-settings block does not re-query the project row.

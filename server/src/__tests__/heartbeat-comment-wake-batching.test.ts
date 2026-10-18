@@ -995,14 +995,33 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
 
       gateway.releaseFirstWait();
 
-      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
+      // INT-471 (CR-INT-466-01): the comment-wake exemption is gone. The
+      // deferred mention wake still promotes, but Gate A cancels the run
+      // (card_closed) before it can execute — the mentioned agent is not
+      // woken on a closed card, and the issue stays done.
       await waitFor(async () => {
         const runs = await db
-          .select()
+          .select({ status: heartbeatRuns.status })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.companyId, companyId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        return runs.length === 2 && runs.every((run) => run.status === "succeeded" || run.status === "cancelled");
       }, 90_000);
+
+      const runsAfterPromotion = await db
+        .select({
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          startedAt: heartbeatRuns.startedAt,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, companyId))
+        .orderBy(asc(heartbeatRuns.createdAt));
+      expect(runsAfterPromotion[0]).toMatchObject({ status: "succeeded" });
+      expect(runsAfterPromotion[1]).toMatchObject({
+        status: "cancelled",
+        errorCode: "card_closed",
+        startedAt: null,
+      });
 
       const issueAfterPromotion = await db
         .select({
@@ -1018,22 +1037,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       });
       expect(issueAfterPromotion?.completedAt).not.toBeNull();
 
-      const secondPayload = gateway.getAgentPayloads()[1] ?? {};
-      expect(secondPayload.paperclip).toBeUndefined();
-      const secondWake = parseWakePayloadFromMessage(secondPayload.message);
-      expect(secondWake).toMatchObject({
-        reason: "issue_comment_mentioned",
-        commentIds: [comment.id],
-        latestCommentId: comment.id,
-        issue: {
-          id: issueId,
-          identifier: `${issuePrefix}-1`,
-          title: "Do not reopen from agent mention",
-          status: "done",
-          priority: "medium",
-        },
-      });
-      expect(String(secondPayload.message ?? "")).toContain("please review after I finish");
+      // The mentioned agent is never woken on the closed card: only the first
+      // run ever reached the gateway.
+      expect(gateway.getAgentPayloads().length).toBe(1);
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();
@@ -1177,17 +1183,34 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
 
       gateway.releaseFirstWait();
 
-      // The deferred wake still promotes (so the agent gets the message), but
-      // the issue must remain `done` because the only referenced comment is
-      // self-authored by the run that is now ending.
-      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
+      // INT-471 (CR-INT-466-01): the deferred wake still promotes, but Gate A
+      // cancels the promoted run (card_closed) before it can execute — the
+      // issue must remain `done` because the only referenced comment is
+      // self-authored by the run that is now ending, and no second wake may
+      // run on a closed card.
       await waitFor(async () => {
         const runs = await db
-          .select()
+          .select({ status: heartbeatRuns.status })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.agentId, agentId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        return runs.length === 2 && runs.every((run) => run.status === "succeeded" || run.status === "cancelled");
       }, 90_000);
+
+      const runsAfterPromotion = await db
+        .select({
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          startedAt: heartbeatRuns.startedAt,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId))
+        .orderBy(asc(heartbeatRuns.createdAt));
+      expect(runsAfterPromotion[0]).toMatchObject({ status: "succeeded" });
+      expect(runsAfterPromotion[1]).toMatchObject({
+        status: "cancelled",
+        errorCode: "card_closed",
+        startedAt: null,
+      });
 
       const issueAfterPromotion = await db
         .select({
@@ -1202,6 +1225,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         status: "done",
       });
       expect(issueAfterPromotion?.completedAt).not.toBeNull();
+      expect(gateway.getAgentPayloads().length).toBe(1);
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();

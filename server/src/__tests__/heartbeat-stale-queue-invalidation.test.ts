@@ -1121,9 +1121,13 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         .then((rows) => rows[0] ?? null),
     ]);
 
+    // INT-465 Gate A: a plain assignment wake on a done/cancelled card is now
+    // cancelled by the promotion gate (card_closed) BEFORE claimQueuedRun, so
+    // the staleness path (issue_terminal_status / skipped) no longer fires for
+    // this case. Gate A is the canonical owner of "run in closed card dies".
     expect(run?.status).toBe("cancelled");
-    expect(run?.errorCode).toBe("issue_terminal_status");
-    expect(wakeup?.status).toBe("skipped");
+    expect(run?.errorCode).toBe("card_closed");
+    expect(wakeup?.status).toBe("cancelled");
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 

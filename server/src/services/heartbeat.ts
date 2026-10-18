@@ -2032,6 +2032,15 @@ function normalizeMaxConcurrentRuns(value: unknown) {
   return Math.max(HEARTBEAT_MAX_CONCURRENT_RUNS_MIN, Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed));
 }
 
+// Serializacao GLOBAL (fork): teto de runs "running" por EMPRESA.
+// Default 1 = 1 run por vez (1 agente + 1 tarefa por vez). Override sem rebuild:
+// PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS=2 no EnvironmentFile do paperclip.service.
+function globalMaxConcurrentRuns() {
+  const parsed = Math.floor(Number(process.env.PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS ?? 1));
+  if (!Number.isFinite(parsed) || parsed < 1) return 1;
+  return parsed;
+}
+
 interface WakeupOptions {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -10633,6 +10642,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  // Serializacao GLOBAL (fork 18/09/2026): runs "running" na EMPRESA inteira.
+  // Gate global = 1 run por vez -> 1 agente por vez -> 1 tarefa por vez.
+  async function countRunningRunsForCompany(companyId: string) {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "running")));
+    return Number(count ?? 0);
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -10737,7 +10756,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         startedAt: run.startedAt ?? claimedAt,
         updatedAt: claimedAt,
       })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.status, "queued"),
+        // Serializacao GLOBAL (fork): nao reivindica se JA existe run "running"
+        // em QUALQUER agente da mesma empresa (NOT EXISTS = atomico no Postgres,
+        // evita corrida entre dois agentes no mesmo tick).
+        sql`(SELECT count(*) FROM heartbeat_runs hr WHERE hr.company_id = ${run.companyId} AND hr.status = 'running') < ${globalMaxConcurrentRuns()}`,
+      ))
       .returning()
       .then((rows) => rows[0] ?? null);
     if (!claimed) return null;
@@ -11678,6 +11704,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  // Gate A/B (INT-465): a queued run whose card is closed (done/cancelled) or
+  // whose project is closed (paused_at/archived_at) dies BEFORE promotion.
+  // It never reaches claimQueuedRun/executeRun and never consumes a slot.
+  async function cancelQueuedRunByClosedGate(
+    run: typeof heartbeatRuns.$inferSelect,
+    errorCode: "card_closed" | "project_closed",
+    logMessage: string,
+  ) {
+    const finishedAt = new Date();
+    await setRunStatus(run.id, "cancelled", {
+      finishedAt,
+      error: logMessage,
+      errorCode,
+    });
+    logger.info({ runId: run.id, errorCode }, logMessage);
+    if (run.wakeupRequestId) {
+      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+        reason: errorCode,
+        finishedAt,
+        error: logMessage,
+      });
+    }
+    // INT-471: a deferred-wake promotion stamps issues.executionRunId before
+    // the run is queued. When the gate then kills that run, the card would be
+    // left locked to a dead run — clear the lock the same way the staleness
+    // cancellation does (guarded on executionRunId === run.id).
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (issueId) {
+      await db
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: finishedAt,
+        })
+        .where(
+          and(
+            eq(issues.companyId, run.companyId),
+            eq(issues.id, issueId),
+            eq(issues.executionRunId, run.id),
+          ),
+        );
+    }
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
@@ -11694,7 +11766,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+      const companyRunningCount = await countRunningRunsForCompany(agent.companyId);
+      const globalMax = globalMaxConcurrentRuns();
+      const availableSlots = Math.max(
+        0,
+        Math.min(policy.maxConcurrentRuns - runningCount, globalMax - companyRunningCount),
+      );
       if (availableSlots <= 0) return [];
 
       const queuedRuns = await db
@@ -11719,6 +11796,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           id: issues.id,
           status: issues.status,
           priority: issues.priority,
+          projectId: issues.projectId,
         })
         .from(issues)
         .where(
@@ -11727,6 +11805,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : sql`false`,
         );
       const issueById = new Map(issueRows.map((row) => [row.id, row]));
+      // Gate B (INT-465): resolve closed projects (paused_at/archived_at) for
+      // the queued runs' cards so promotion can cancel them before claiming.
+      const gateProjectIds = [...new Set(
+        issueRows.map((row) => row.projectId).filter((projectId): projectId is string => Boolean(projectId)),
+      )];
+      const closedProjectRows = gateProjectIds.length > 0
+        ? await db
+          .select({ id: projects.id, pausedAt: projects.pausedAt, archivedAt: projects.archivedAt })
+          .from(projects)
+          .where(and(eq(projects.companyId, agent.companyId), inArray(projects.id, gateProjectIds)))
+        : [];
+      const closedProjectById = new Map(
+        closedProjectRows
+          .filter((project) => project.pausedAt !== null || project.archivedAt !== null)
+          .map((project) => [project.id, project]),
+      );
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
       const prioritizedRuns = [...queuedRuns].sort((left, right) => {
         const leftIssueId = readNonEmptyString(parseObject(left.contextSnapshot).issueId);
@@ -11749,6 +11843,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
+        // Gate A (INT-465, exemption removed by CR-INT-466-01/INT-471): a
+        // queued run whose card is done/cancelled is cancelled before
+        // promotion and never consumes a slot — NO exception for comment
+        // wakes or resume intents. A run in a closed card can never run.
+        // Flows that legitimately need work on a closed card reopen it first
+        // (human comment reopen at routes/issues.ts, resume/reopen moves to
+        // todo), so the card is open by the time the run is promoted.
+        const gateIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+        const gateIssue = gateIssueId ? issueById.get(gateIssueId) : null;
+        if (gateIssue && (gateIssue.status === "done" || gateIssue.status === "cancelled")) {
+          await cancelQueuedRunByClosedGate(
+            queuedRun,
+            "card_closed",
+            `[gate] run ${queuedRun.id} cancelada: card ${gateIssueId} está ${gateIssue.status}`,
+          );
+          continue;
+        }
+        // Gate B (INT-465): a queued run whose card belongs to a closed
+        // project (paused_at/archived_at) is cancelled before promotion.
+        if (gateIssue?.projectId && closedProjectById.has(gateIssue.projectId)) {
+          await cancelQueuedRunByClosedGate(
+            queuedRun,
+            "project_closed",
+            `[gate] run ${queuedRun.id} cancelada: projeto ${gateIssue.projectId} encerrado (card ${gateIssueId})`,
+          );
+          continue;
+        }
         const claimed = await claimQueuedRun(queuedRun, companyAgents);
         if (claimed) claimedRuns.push(claimed);
       }
